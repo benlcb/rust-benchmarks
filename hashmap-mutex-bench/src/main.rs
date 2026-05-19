@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const ITERATIONS: usize = 1_000_000;
 const THREADED_REQUESTS: usize = 100_000;
-const MAX_CONCURRENT_THREADS: usize = 50_000;
+const MAX_CONCURRENT_THREADS: usize = 4_000;
 const KEY_PREFIX: &str = "abcdefghijklmno";
 const NUM_KEYS: u32 = 100;
 
@@ -98,12 +98,13 @@ fn run_threaded() {
         .map(|_| (xorshift64(&mut rng_state) % NUM_KEYS as u64) as usize)
         .collect();
 
-    let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(MAX_CONCURRENT_THREADS);
+    let mut handles: Vec<thread::JoinHandle<u128>> = Vec::with_capacity(MAX_CONCURRENT_THREADS);
+    let mut samples_ns: Vec<u128> = Vec::with_capacity(THREADED_REQUESTS);
 
     let start = Instant::now();
     for idx in access_indices {
         if handles.len() >= MAX_CONCURRENT_THREADS {
-            handles.remove(0).join().unwrap();
+            samples_ns.push(handles.remove(0).join().unwrap());
         }
         let map = Arc::clone(&map);
         let keys = Arc::clone(&keys);
@@ -111,21 +112,33 @@ fn run_threaded() {
             .stack_size(64 * 1024)
             .spawn(move || {
                 let key = &keys[idx];
-                let mut guard = map.lock().unwrap();
-                let entry = guard.get_mut(key).unwrap();
-                *entry += 1;
+                let t = Instant::now();
+                {
+                    let mut guard = map.lock().unwrap();
+                    let entry = guard.get_mut(key).unwrap();
+                    *entry += 1;
+                }
+                t.elapsed().as_nanos()
             })
             .expect("failed to spawn thread");
         handles.push(handle);
     }
     for h in handles {
-        h.join().unwrap();
+        samples_ns.push(h.join().unwrap());
     }
     let elapsed = start.elapsed();
 
+    samples_ns.sort_unstable();
     let final_total: u64 = map.lock().unwrap().values().sum();
     let total_ns = elapsed.as_nanos();
     let avg_ns = total_ns as f64 / THREADED_REQUESTS as f64;
+    let sum_ns: u128 = samples_ns.iter().sum();
+    let mean = sum_ns as f64 / samples_ns.len() as f64;
+    let min = *samples_ns.first().unwrap();
+    let max = *samples_ns.last().unwrap();
+    let p50 = samples_ns[samples_ns.len() / 2];
+    let p95 = samples_ns[(samples_ns.len() as f64 * 0.95) as usize];
+    let p99 = samples_ns[(samples_ns.len() as f64 * 0.99) as usize];
 
     println!();
     println!("=== Benchmark 2: {}-threaded lock+update+unlock ===", THREADED_REQUESTS);
@@ -135,6 +148,12 @@ fn run_threaded() {
     println!("  sum of vals:  {}", final_total);
     println!("  total time:   {:.3} ms", total_ns as f64 / 1_000_000.0);
     println!("  avg/request:  {:.2} ns", avg_ns);
+    println!("  mean:         {:.2} ns", mean);
+    println!("  min:          {} ns", min);
+    println!("  p50:          {} ns", p50);
+    println!("  p95:          {} ns", p95);
+    println!("  p99:          {} ns", p99);
+    println!("  max:          {} ns", max);
 }
 
 fn main() {
